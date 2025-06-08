@@ -1,7 +1,3 @@
-"""
-Calculate optimal crop windows for reframing
-"""
-
 import numpy as np
 from typing import Tuple, Optional, Dict
 
