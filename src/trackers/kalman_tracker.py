@@ -1,7 +1,3 @@
-"""
-Kalman filter for smooth tracking
-"""
-
 import numpy as np
 from filterpy.kalman import KalmanFilter
 from typing import Tuple, Optional
