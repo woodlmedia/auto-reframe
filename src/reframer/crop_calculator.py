@@ -1,17 +1,16 @@
-import cv2
 import numpy as np
 from typing import Tuple, Optional, Dict
 
 
 class CropCalculator:
-    """Calculate crop windows for video reframing"""
+    """Calculate crop windows for video reframing - X-axis only"""
     
     def __init__(
         self,
         output_aspect_ratio: Tuple[int, int],
         padding_ratio: float = 0.1,
-        min_zoom: float = 0.5,
-        max_zoom: float = 2.0,
+        min_zoom: float = 1.0,  # Always 1.0 - no zoom
+        max_zoom: float = 1.0,  # Always 1.0 - no zoom
         lead_room: float = 0.0
     ):
         """
@@ -19,30 +18,29 @@ class CropCalculator:
         
         Args:
             output_aspect_ratio: Target aspect ratio (width, height)
-            padding_ratio: Extra padding around subject (0-1)
-            min_zoom: Minimum zoom level
-            max_zoom: Maximum zoom level
+            padding_ratio: Not used (kept for compatibility)
+            min_zoom: Ignored - always 1.0
+            max_zoom: Ignored - always 1.0
             lead_room: Horizontal offset for subject (0-0.5)
         """
         self.output_aspect = output_aspect_ratio[0] / output_aspect_ratio[1]
-        self.padding_ratio = padding_ratio
-        self.min_zoom = min_zoom
-        self.max_zoom = max_zoom
         self.lead_room = lead_room
+        
+        # Force no zoom
+        self.min_zoom = 1.0
+        self.max_zoom = 1.0
         
     def calculate_crop(
         self,
-        target_center: Tuple[float, float],
-        target_size: Optional[float],
+        target_x: float,
         frame_shape: Tuple[int, int],
         previous_crop: Optional[Dict] = None
     ) -> Dict:
         """
-        Calculate crop window
+        Calculate crop window (X-axis adjustment only)
         
         Args:
-            target_center: (x, y) center of target
-            target_size: Size of target (for zoom calculation)
+            target_x: X position of target
             frame_shape: (height, width) of frame
             previous_crop: Previous crop for smooth transitions
             
@@ -52,7 +50,7 @@ class CropCalculator:
         h, w = frame_shape
         frame_aspect = w / h
         
-        # Calculate base crop dimensions
+        # Calculate fixed crop dimensions (no zoom)
         if frame_aspect > self.output_aspect:
             # Frame is wider than output - fit height
             crop_height = h
@@ -62,47 +60,35 @@ class CropCalculator:
             crop_width = w
             crop_height = int(crop_width / self.output_aspect)
         
-        # Apply zoom based on target size
-        if target_size is not None:
-            # Estimate ideal crop size to frame subject
-            ideal_height = target_size * (1 + self.padding_ratio) * 2
-            zoom = np.clip(h / ideal_height, self.min_zoom, self.max_zoom)
-            
-            crop_width = int(crop_width / zoom)
-            crop_height = int(crop_height / zoom)
+        # Fixed Y position (centered vertically)
+        y = (h - crop_height) // 2
         
-        # Apply lead room
-        center_x = target_center[0]
-        if self.lead_room != 0:
-            # Offset center based on movement direction
-            if previous_crop:
-                prev_center = previous_crop['center_x']
-                if center_x > prev_center:
-                    # Moving right - add lead room to right
-                    center_x += crop_width * self.lead_room * 0.5
-                elif center_x < prev_center:
-                    # Moving left - add lead room to left
-                    center_x -= crop_width * self.lead_room * 0.5
+        # Calculate X position based on target
+        center_x = target_x
         
-        # Calculate crop position
+        # Apply lead room if specified
+        if self.lead_room != 0 and previous_crop:
+            prev_center = previous_crop['center_x']
+            if center_x > prev_center:
+                # Moving right - add lead room to right
+                center_x += crop_width * self.lead_room * 0.3
+            elif center_x < prev_center:
+                # Moving left - add lead room to left
+                center_x -= crop_width * self.lead_room * 0.3
+        
+        # Calculate crop X position
         x = int(center_x - crop_width / 2)
-        y = int(target_center[1] - crop_height / 2)
         
-        # Constrain to frame bounds
+        # Constrain to frame bounds (X-axis only)
         x = max(0, min(x, w - crop_width))
-        y = max(0, min(y, h - crop_height))
-        
-        # Ensure minimum crop size
-        crop_width = max(100, crop_width)
-        crop_height = max(100, crop_height)
         
         return {
             'x': x,
             'y': y,
             'width': crop_width,
             'height': crop_height,
-            'center_x': center_x,
-            'center_y': target_center[1]
+            'center_x': x + crop_width / 2,
+            'center_y': h / 2  # Always centered vertically
         }
     
     def smooth_transition(
@@ -112,7 +98,7 @@ class CropCalculator:
         smoothing: float = 0.1
     ) -> Dict:
         """
-        Smooth transition between crops
+        Smooth transition between crops (X-axis only)
         
         Args:
             current_crop: Current crop window
@@ -122,18 +108,16 @@ class CropCalculator:
         Returns:
             Smoothed crop window
         """
-        # Exponential smoothing for all parameters
-        smoothed = {}
+        # Only smooth X position, keep everything else fixed
+        smoothed = target_crop.copy()
         
-        for key in ['x', 'y', 'width', 'height']:
-            smoothed[key] = int(
-                smoothing * target_crop[key] + 
-                (1 - smoothing) * current_crop[key]
-            )
+        smoothed['x'] = int(
+            smoothing * target_crop['x'] + 
+            (1 - smoothing) * current_crop['x']
+        )
         
-        # Update centers
+        # Update center
         smoothed['center_x'] = smoothed['x'] + smoothed['width'] / 2
-        smoothed['center_y'] = smoothed['y'] + smoothed['height'] / 2
         
         return smoothed
     
@@ -154,14 +138,23 @@ class CropCalculator:
         Returns:
             Cropped and resized frame
         """
+        import cv2
+        
         # Extract crop region
         x, y = crop['x'], crop['y']
         w, h = crop['width'], crop['height']
         
+        # Ensure crop bounds are within frame
+        frame_h, frame_w = frame.shape[:2]
+        x = max(0, min(x, frame_w - w))
+        y = max(0, min(y, frame_h - h))
+        w = min(w, frame_w - x)
+        h = min(h, frame_h - y)
+        
         cropped = frame[y:y+h, x:x+w]
         
         # Resize if output size specified
-        if output_size:
+        if output_size and (output_size[0] != w or output_size[1] != h):
             cropped = cv2.resize(
                 cropped,
                 output_size,
