@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Main entry point for the Auto Reframe application
-"""
-
 import argparse
 import sys
 from pathlib import Path
