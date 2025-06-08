@@ -3,14 +3,14 @@ from typing import Tuple, Optional, Dict
 
 
 class CropCalculator:
-    """Calculate crop windows for video reframing - X-axis only"""
+    """Calculate crop windows - only shifts X position, no resize or zoom"""
     
     def __init__(
         self,
         output_aspect_ratio: Tuple[int, int],
-        padding_ratio: float = 0.1,
-        min_zoom: float = 1.0,  # Always 1.0 - no zoom
-        max_zoom: float = 1.0,  # Always 1.0 - no zoom
+        padding_ratio: float = 0.0,  # Not used
+        min_zoom: float = 1.0,  # Not used
+        max_zoom: float = 1.0,  # Not used
         lead_room: float = 0.0
     ):
         """
@@ -18,17 +18,10 @@ class CropCalculator:
         
         Args:
             output_aspect_ratio: Target aspect ratio (width, height)
-            padding_ratio: Not used (kept for compatibility)
-            min_zoom: Ignored - always 1.0
-            max_zoom: Ignored - always 1.0
             lead_room: Horizontal offset for subject (0-0.5)
         """
         self.output_aspect = output_aspect_ratio[0] / output_aspect_ratio[1]
         self.lead_room = lead_room
-        
-        # Force no zoom
-        self.min_zoom = 1.0
-        self.max_zoom = 1.0
         
     def calculate_crop(
         self,
@@ -37,7 +30,7 @@ class CropCalculator:
         previous_crop: Optional[Dict] = None
     ) -> Dict:
         """
-        Calculate crop window (X-axis adjustment only)
+        Calculate crop window - ONLY X position shift
         
         Args:
             target_x: X position of target
@@ -50,20 +43,21 @@ class CropCalculator:
         h, w = frame_shape
         frame_aspect = w / h
         
-        # Calculate fixed crop dimensions (no zoom)
+        # Calculate crop width based on output aspect ratio
+        # But we'll use the full frame height to avoid any vertical cropping
         if frame_aspect > self.output_aspect:
-            # Frame is wider than output - fit height
+            # Frame is wider than output - we need to crop horizontally
             crop_height = h
             crop_width = int(crop_height * self.output_aspect)
         else:
-            # Frame is taller than output - fit width
+            # Frame aspect matches or is narrower - use full frame
             crop_width = w
-            crop_height = int(crop_width / self.output_aspect)
+            crop_height = h
         
-        # Fixed Y position (centered vertically)
-        y = (h - crop_height) // 2
+        # Always start at top of frame (no vertical movement)
+        y = 0
         
-        # Calculate X position based on target
+        # Calculate X position to center on target
         center_x = target_x
         
         # Apply lead room if specified
@@ -79,7 +73,7 @@ class CropCalculator:
         # Calculate crop X position
         x = int(center_x - crop_width / 2)
         
-        # Constrain to frame bounds (X-axis only)
+        # Constrain to frame bounds
         x = max(0, min(x, w - crop_width))
         
         return {
@@ -88,7 +82,10 @@ class CropCalculator:
             'width': crop_width,
             'height': crop_height,
             'center_x': x + crop_width / 2,
-            'center_y': h / 2  # Always centered vertically
+            'center_y': h / 2,
+            # Store original dimensions for no-resize mode
+            'original_width': w,
+            'original_height': h
         }
     
     def smooth_transition(
@@ -98,7 +95,7 @@ class CropCalculator:
         smoothing: float = 0.1
     ) -> Dict:
         """
-        Smooth transition between crops (X-axis only)
+        Smooth transition between crops (X position only)
         
         Args:
             current_crop: Current crop window
@@ -108,7 +105,7 @@ class CropCalculator:
         Returns:
             Smoothed crop window
         """
-        # Only smooth X position, keep everything else fixed
+        # Only smooth X position
         smoothed = target_crop.copy()
         
         smoothed['x'] = int(
@@ -128,15 +125,15 @@ class CropCalculator:
         output_size: Optional[Tuple[int, int]] = None
     ) -> np.ndarray:
         """
-        Apply crop to frame
+        Apply crop to frame - NO RESIZING
         
         Args:
             frame: Input frame
             crop: Crop window dictionary
-            output_size: Output size (width, height)
+            output_size: IGNORED - we never resize
             
         Returns:
-            Cropped and resized frame
+            Cropped frame at original resolution
         """
         import cv2
         
@@ -151,14 +148,7 @@ class CropCalculator:
         w = min(w, frame_w - x)
         h = min(h, frame_h - y)
         
+        # Just crop, NO RESIZE
         cropped = frame[y:y+h, x:x+w]
-        
-        # Resize if output size specified
-        if output_size and (output_size[0] != w or output_size[1] != h):
-            cropped = cv2.resize(
-                cropped,
-                output_size,
-                interpolation=cv2.INTER_LINEAR
-            )
         
         return cropped
