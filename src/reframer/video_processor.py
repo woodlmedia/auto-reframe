@@ -97,12 +97,22 @@ class VideoProcessor:
         start_frame = int(start_time * fps) if start_time else 0
         end_frame = int(end_time * fps) if end_time else total_frames
         
-        # Calculate output dimensions
+        # Calculate output dimensions based on aspect ratio
         aspect_ratio = self.config['reframing']['default_aspect_ratio']
-        output_height = 1080  # Default HD height
-        output_width = int(output_height * aspect_ratio[0] / aspect_ratio[1])
+        frame_aspect = width / height
+        output_aspect = aspect_ratio[0] / aspect_ratio[1]
         
-        # Create video writer
+        # Determine output dimensions (crop size, not resize)
+        if frame_aspect > output_aspect:
+            # Frame is wider - crop horizontally
+            output_height = height
+            output_width = int(height * output_aspect)
+        else:
+            # Frame matches or is narrower - use full frame
+            output_width = width
+            output_height = height
+        
+        # Create video writer with crop dimensions
         writer = create_video_writer(
             output_path,
             fps,
@@ -136,11 +146,11 @@ class VideoProcessor:
                 if current_frame >= end_frame:
                     break
                 
-                # Process frame with interpolated tracking
+                # Process frame with interpolated tracking - NO RESIZE
                 output_frame = self.process_frame_interpolated(
                     frame,
                     current_frame,
-                    (output_width, output_height)
+                    None  # No output size - keep original dimensions
                 )
                 
                 # Write frame
@@ -230,7 +240,7 @@ class VideoProcessor:
         self,
         frame: np.ndarray,
         frame_num: int,
-        output_size: Tuple[int, int]
+        output_size: Optional[Tuple[int, int]]
     ) -> np.ndarray:
         """
         Process single frame using interpolated positions
@@ -238,10 +248,10 @@ class VideoProcessor:
         Args:
             frame: Input frame
             frame_num: Frame number
-            output_size: Output size (width, height)
+            output_size: IGNORED - we never resize
             
         Returns:
-            Processed frame
+            Processed frame (cropped only, no resize)
         """
         h, w = frame.shape[:2]
         
@@ -258,11 +268,11 @@ class VideoProcessor:
         # No additional smoothing needed - already interpolated
         self.current_crop = target_crop
         
-        # Apply crop and resize
+        # Apply crop WITHOUT resize
         output_frame = self.crop_calculator.apply_crop(
             frame,
             target_crop,
-            output_size
+            None  # No resize
         )
         
         return output_frame
@@ -270,14 +280,14 @@ class VideoProcessor:
     def process_frame(
         self,
         frame: np.ndarray,
-        output_size: Tuple[int, int]
+        output_size: Optional[Tuple[int, int]]
     ) -> np.ndarray:
         """
         Process single frame (legacy method for compatibility)
         
         Args:
             frame: Input frame
-            output_size: Output size (width, height)
+            output_size: IGNORED - we never resize
             
         Returns:
             Processed frame
@@ -320,11 +330,11 @@ class VideoProcessor:
         self.current_crop = target_crop
         self.frame_count += 1
         
-        # Apply crop and resize
+        # Apply crop WITHOUT resize
         output_frame = self.crop_calculator.apply_crop(
             frame,
             target_crop,
-            output_size
+            None  # No resize
         )
         
         return output_frame
@@ -398,7 +408,19 @@ class VideoProcessor:
         
         # Resize frames
         original_small = cv2.resize(original, (preview_w, preview_h))
-        output_small = cv2.resize(output, (preview_w, preview_h))
+        
+        # Output might have different dimensions, so calculate its scale
+        out_h, out_w = output.shape[:2]
+        output_scale = min(preview_h / out_h, preview_w / out_w)
+        output_preview_w = int(out_w * output_scale)
+        output_preview_h = int(out_h * output_scale)
+        output_small = cv2.resize(output, (output_preview_w, output_preview_h))
+        
+        # Pad output to match original preview size
+        output_padded = np.zeros((preview_h, preview_w, 3), dtype=np.uint8)
+        y_offset = (preview_h - output_preview_h) // 2
+        x_offset = (preview_w - output_preview_w) // 2
+        output_padded[y_offset:y_offset+output_preview_h, x_offset:x_offset+output_preview_w] = output_small
         
         # Draw overlay on original
         if self.current_crop:
@@ -426,7 +448,7 @@ class VideoProcessor:
                 cv2.line(original_small, (x, 0), (x, preview_h), color, 1)
         
         # Combine side by side
-        preview = np.hstack([original_small, output_small])
+        preview = np.hstack([original_small, output_padded])
         
         # Add labels
         cv2.putText(
