@@ -1,7 +1,3 @@
-"""
-Simple exponential smoothing tracker
-"""
-
 import numpy as np
 from typing import Tuple, Optional, List
 from collections import deque
