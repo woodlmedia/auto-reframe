@@ -1,7 +1,3 @@
-"""
-Object detection using YOLOv8 for fallback when no people detected
-"""
-
 import cv2
 import numpy as np
 from typing import List, Dict, Optional
