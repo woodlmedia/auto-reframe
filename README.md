@@ -1,4 +1,4 @@
-# Auto Reframe - Intelligent Video Stabilization & Reframing
+o Reframe - Intelligent Video Stabilization & Reframing
 
 Automatically reframe and stabilize videos by tracking people or salient objects. Perfect for converting horizontal videos to vertical format while keeping subjects in frame.
 
