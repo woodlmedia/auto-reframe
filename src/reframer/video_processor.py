@@ -6,16 +6,17 @@ import logging
 from tqdm import tqdm
 
 from ..detectors import FaceDetector, PoseDetector, ObjectDetector
-from ..trackers import KalmanTracker, SmoothTracker
+from ..trackers import KeyframeTracker
 from .crop_calculator import CropCalculator
 from ..utils.video_utils import get_video_info, create_video_writer
 from ..utils.visualization import draw_tracking_overlay
+from ..utils.scene_detector import AdaptiveSceneDetector
 
 logger = logging.getLogger(__name__)
 
 
 class VideoProcessor:
-    """Process videos with intelligent reframing"""
+    """Process videos with intelligent reframing using keyframe tracking"""
     
     def __init__(self, config: Dict):
         """
@@ -26,9 +27,9 @@ class VideoProcessor:
         """
         self.config = config
         
-        # Initialize detectors
+        # Initialize detectors with higher confidence
         self.face_detector = FaceDetector(
-            config['detection']['face_confidence']
+            min_detection_confidence=0.7  # Higher for better accuracy
         )
         self.pose_detector = PoseDetector(
             config['detection']['pose_confidence']
@@ -38,23 +39,23 @@ class VideoProcessor:
             preferred_classes=config['objects']['preferred_classes']
         )
         
-        # Initialize tracker
-        if config['tracking'].get('use_kalman', True):
-            self.tracker = KalmanTracker(
-                process_noise=config['tracking']['kalman_process_noise'],
-                measurement_noise=config['tracking']['kalman_measurement_noise']
-            )
-        else:
-            self.tracker = SmoothTracker(
-                smoothing_factor=config['tracking']['smoothing_factor']
-            )
+        # Initialize keyframe tracker
+        self.tracker = KeyframeTracker(
+            confidence_threshold=0.25,  # Only track if confidence > 25%
+            interpolation_method='cubic',
+            min_keyframe_distance=5
+        )
         
-        # Initialize crop calculator
+        # Initialize scene detector
+        self.scene_detector = AdaptiveSceneDetector(
+            initial_threshold=30.0,
+            min_scene_length=10,
+            adaptation_rate=0.1
+        )
+        
+        # Initialize crop calculator (X-axis only)
         self.crop_calculator = CropCalculator(
             output_aspect_ratio=config['reframing']['default_aspect_ratio'],
-            padding_ratio=config['reframing']['padding_ratio'],
-            min_zoom=config['reframing']['min_zoom'],
-            max_zoom=config['reframing']['max_zoom'],
             lead_room=config['reframing']['lead_room']
         )
         
@@ -63,6 +64,7 @@ class VideoProcessor:
         self.current_crop = None
         self.lost_frames = 0
         self.max_lost_frames = config['tracking']['max_lost_frames']
+        self.frame_count = 0
         
     def process(
         self,
@@ -73,7 +75,7 @@ class VideoProcessor:
         end_time: Optional[float] = None
     ):
         """
-        Process video file
+        Process video file with keyframe tracking
         
         Args:
             input_path: Path to input video
@@ -112,22 +114,32 @@ class VideoProcessor:
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
-        # Process frames
+        # First pass: detect all targets and scene changes
+        logger.info("First pass: Analyzing video...")
+        self._analyze_video(cap, start_frame, end_frame)
+        
+        # Reset video
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        self.frame_count = start_frame
+        
+        # Second pass: process with interpolated positions
+        logger.info("Second pass: Processing video...")
         frame_count = end_frame - start_frame
+        
         with tqdm(total=frame_count, desc="Processing") as pbar:
-            
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                if current_frame > end_frame:
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                if current_frame >= end_frame:
                     break
                 
-                # Process frame
-                output_frame = self.process_frame(
+                # Process frame with interpolated tracking
+                output_frame = self.process_frame_interpolated(
                     frame,
+                    current_frame,
                     (output_width, output_height)
                 )
                 
@@ -136,7 +148,6 @@ class VideoProcessor:
                 
                 # Show preview
                 if preview:
-                    # Create preview with overlay
                     preview_frame = self.create_preview(frame, output_frame)
                     cv2.imshow('Auto Reframe Preview', preview_frame)
                     
@@ -155,13 +166,114 @@ class VideoProcessor:
         self.face_detector.close()
         self.pose_detector.close()
         
+        logger.info(f"Processed {len(self.tracker.keyframes)} keyframes")
+        logger.info(f"Detected {len(self.scene_detector.scene_changes)} scene changes")
+    
+    def _analyze_video(self, cap, start_frame: int, end_frame: int):
+        """First pass: analyze video for keyframes and scene changes"""
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        frame_count = end_frame - start_frame
+        with tqdm(total=frame_count, desc="Analyzing") as pbar:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                if current_frame >= end_frame:
+                    break
+                
+                # Detect scene change
+                is_scene_change = self.scene_detector.detect_scene_change(
+                    frame, current_frame
+                )
+                
+                # Detect target
+                target = self.detect_target(frame)
+                
+                if target:
+                    # Update tracker with confidence
+                    confidence = target.get('confidence', 0.5)
+                    
+                    # Force keyframe on scene change
+                    if is_scene_change:
+                        self.tracker.add_scene_boundary(
+                            current_frame,
+                            target['center'][0]
+                        )
+                    else:
+                        # Normal update with confidence check
+                        self.tracker.update(
+                            target['center'][0],
+                            confidence,
+                            frame_num=current_frame,
+                            force_keyframe=False
+                        )
+                    
+                    self.current_target = target
+                    self.lost_frames = 0
+                else:
+                    self.lost_frames += 1
+                    
+                    # If we just lost tracking at a scene change, add boundary
+                    if is_scene_change and self.current_target:
+                        # Use last known position
+                        self.tracker.add_scene_boundary(
+                            current_frame,
+                            self.current_target['center'][0]
+                        )
+                
+                pbar.update(1)
+    
+    def process_frame_interpolated(
+        self,
+        frame: np.ndarray,
+        frame_num: int,
+        output_size: Tuple[int, int]
+    ) -> np.ndarray:
+        """
+        Process single frame using interpolated positions
+        
+        Args:
+            frame: Input frame
+            frame_num: Frame number
+            output_size: Output size (width, height)
+            
+        Returns:
+            Processed frame
+        """
+        h, w = frame.shape[:2]
+        
+        # Get interpolated X position from tracker
+        tracked_x = self.tracker._get_interpolated_position(frame_num)
+        
+        # Calculate crop (X-axis only)
+        target_crop = self.crop_calculator.calculate_crop(
+            tracked_x,
+            (h, w),
+            self.current_crop
+        )
+        
+        # No additional smoothing needed - already interpolated
+        self.current_crop = target_crop
+        
+        # Apply crop and resize
+        output_frame = self.crop_calculator.apply_crop(
+            frame,
+            target_crop,
+            output_size
+        )
+        
+        return output_frame
+    
     def process_frame(
         self,
         frame: np.ndarray,
         output_size: Tuple[int, int]
     ) -> np.ndarray:
         """
-        Process single frame
+        Process single frame (legacy method for compatibility)
         
         Args:
             frame: Input frame
@@ -176,19 +288,14 @@ class VideoProcessor:
         target = self.detect_target(frame)
         
         if target:
-            # Update tracker
-            tracked_center = self.tracker.update(target['center'])
+            # Update tracker with confidence
+            confidence = target.get('confidence', 0.5)
+            tracked_x = self.tracker.update(
+                target['center'][0],
+                confidence,
+                frame_num=self.frame_count
+            )
             
-            # Calculate target size
-            if target['type'] in ['face', 'pose']:
-                bbox = target['bbox']
-                target_size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-            else:
-                # For objects, use bbox area
-                bbox = target['bbox']
-                target_size = np.sqrt((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
-            
-            # Update current target
             self.current_target = target
             self.lost_frames = 0
         else:
@@ -196,40 +303,27 @@ class VideoProcessor:
             self.lost_frames += 1
             
             if self.lost_frames < self.max_lost_frames and self.current_target:
-                # Use predicted position
-                tracked_center = self.tracker.predict_next()
-                target_size = None
+                # Use last interpolated position
+                tracked_x = self.tracker._get_interpolated_position(self.frame_count)
             else:
-                # Lost tracking - reset to center
-                tracked_center = (w // 2, h // 2)
-                target_size = None
+                # Lost tracking - use center
+                tracked_x = w // 2
                 self.current_target = None
-                self.tracker.reset()
         
-        # Calculate crop
+        # Calculate crop (X-axis only)
         target_crop = self.crop_calculator.calculate_crop(
-            tracked_center,
-            target_size,
+            tracked_x,
             (h, w),
             self.current_crop
         )
         
-        # Smooth transition
-        if self.current_crop:
-            smoothed_crop = self.crop_calculator.smooth_transition(
-                self.current_crop,
-                target_crop,
-                self.config['tracking']['smoothing_factor']
-            )
-        else:
-            smoothed_crop = target_crop
-        
-        self.current_crop = smoothed_crop
+        self.current_crop = target_crop
+        self.frame_count += 1
         
         # Apply crop and resize
         output_frame = self.crop_calculator.apply_crop(
             frame,
-            smoothed_crop,
+            target_crop,
             output_size
         )
         
@@ -237,7 +331,7 @@ class VideoProcessor:
     
     def detect_target(self, frame: np.ndarray) -> Optional[Dict]:
         """
-        Detect best target in frame
+        Detect best target in frame with confidence
         
         Args:
             frame: Input frame
@@ -247,17 +341,17 @@ class VideoProcessor:
         """
         all_detections = []
         
-        # Detect faces
+        # Detect faces (highest priority)
         faces = self.face_detector.detect(frame)
         all_detections.extend(faces)
         
-        # Detect poses if no faces
-        if not faces:
+        # Detect poses if no high-confidence faces
+        if not any(f['confidence'] > 0.5 for f in faces):
             poses = self.pose_detector.detect(frame)
             all_detections.extend(poses)
         
-        # Detect objects if no people
-        if not all_detections:
+        # Detect objects if no people with good confidence
+        if not any(d['confidence'] > 0.3 for d in all_detections):
             objects = self.object_detector.detect(frame)
             if objects:
                 # Select best object
@@ -269,21 +363,23 @@ class VideoProcessor:
                 if best_object:
                     all_detections.append(best_object)
         
-        # Select best detection
+        # Select best detection based on confidence and type
         if all_detections:
-            # Prioritize by type: face > pose > object
+            # Prioritize by type and confidence
             type_priority = {'face': 3, 'pose': 2, 'object': 1}
             
-            # Sort by priority and confidence
+            # Sort by weighted score
             all_detections.sort(
                 key=lambda x: (
-                    type_priority.get(x['type'], 0),
-                    x.get('confidence', 0)
+                    type_priority.get(x['type'], 0) * x.get('confidence', 0)
                 ),
                 reverse=True
             )
             
-            return all_detections[0]
+            # Return best if confidence is sufficient
+            best = all_detections[0]
+            if best.get('confidence', 0) > 0.2:  # Lower threshold for detection
+                return best
         
         return None
     
@@ -292,7 +388,7 @@ class VideoProcessor:
         original: np.ndarray,
         output: np.ndarray
     ) -> np.ndarray:
-        """Create side-by-side preview"""
+        """Create side-by-side preview with keyframe visualization"""
         h, w = original.shape[:2]
         
         # Scale for preview
@@ -313,17 +409,41 @@ class VideoProcessor:
                 scale
             )
         
+        # Draw keyframe indicators
+        keyframe_positions = self.tracker.get_keyframe_positions()
+        if keyframe_positions:
+            # Find nearby keyframes
+            current_frame = self.frame_count
+            nearby_keyframes = [
+                kf for kf in keyframe_positions
+                if abs(kf[0] - current_frame) < 30
+            ]
+            
+            # Draw keyframe markers
+            for kf_frame, kf_x in nearby_keyframes:
+                x = int(kf_x * scale)
+                color = (0, 255, 255) if kf_frame == current_frame else (0, 128, 128)
+                cv2.line(original_small, (x, 0), (x, preview_h), color, 1)
+        
         # Combine side by side
         preview = np.hstack([original_small, output_small])
         
         # Add labels
         cv2.putText(
-            preview, "Original", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+            preview, "Original + Tracking", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
         )
         cv2.putText(
-            preview, "Reframed", (preview_w + 10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+            preview, "Reframed Output", (preview_w + 10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
         )
+        
+        # Add confidence info if target exists
+        if self.current_target and 'confidence' in self.current_target:
+            conf_text = f"Confidence: {self.current_target['confidence']:.2f}"
+            cv2.putText(
+                preview, conf_text, (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
+            )
         
         return preview
