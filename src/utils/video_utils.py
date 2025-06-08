@@ -1,7 +1,3 @@
-"""
-Video utility functions
-"""
-
 import cv2
 from typing import Dict, Tuple
 import logging
