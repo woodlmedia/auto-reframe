@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class AutoReframer:
-    """Main class for automatic video reframing"""
+    """Main class for automatic video reframing - X-axis shift only"""
     
     def __init__(
         self,
@@ -26,7 +26,7 @@ class AutoReframer:
         Initialize the Auto Reframer
         
         Args:
-            output_aspect_ratio: Target aspect ratio (width, height)
+            output_aspect_ratio: Target aspect ratio for cropping (width, height)
             smoothing_factor: Smoothing for camera movements (0-1)
             detection_confidence: Minimum confidence for detections
             config_path: Path to custom config file
@@ -38,6 +38,11 @@ class AutoReframer:
         self.config['reframing']['default_aspect_ratio'] = list(output_aspect_ratio)
         self.config['tracking']['smoothing_factor'] = smoothing_factor
         self.config['detection']['face_confidence'] = detection_confidence
+        
+        # Force X-axis only mode
+        self.config['reframing']['x_axis_only'] = True
+        self.config['reframing']['min_zoom'] = 1.0
+        self.config['reframing']['max_zoom'] = 1.0
         
         # Initialize processor
         self.processor = VideoProcessor(self.config)
@@ -59,7 +64,7 @@ class AutoReframer:
         end_time: Optional[float] = None
     ):
         """
-        Process a video file
+        Process a video file - only shifts X position, no resizing
         
         Args:
             input_path: Path to input video
@@ -67,6 +72,10 @@ class AutoReframer:
             preview: Show preview window during processing
             start_time: Start time in seconds
             end_time: End time in seconds
+            
+        Note:
+            Output video will have the same height as input but may be cropped
+            horizontally based on the aspect ratio. NO RESIZING is performed.
         """
         # Validate input
         input_path = Path(input_path)
@@ -77,6 +86,23 @@ class AutoReframer:
         info = get_video_info(str(input_path))
         logger.info(f"Input video: {info['width']}x{info['height']}, "
                    f"{info['fps']} fps, {info['duration']:.1f}s")
+        
+        # Calculate output dimensions (crop only, no resize)
+        aspect_ratio = self.config['reframing']['default_aspect_ratio']
+        output_aspect = aspect_ratio[0] / aspect_ratio[1]
+        input_aspect = info['width'] / info['height']
+        
+        if input_aspect > output_aspect:
+            # Input is wider - crop horizontally
+            output_width = int(info['height'] * output_aspect)
+            output_height = info['height']
+        else:
+            # Input matches or is narrower - use full frame
+            output_width = info['width']
+            output_height = info['height']
+        
+        logger.info(f"Output video will be: {output_width}x{output_height} "
+                   f"(cropped from input, NO RESIZE)")
         
         # Create output directory
         output_path = Path(output_path)
@@ -109,7 +135,7 @@ def parse_aspect_ratio(value: str) -> Tuple[int, int]:
 def main():
     """Command line interface"""
     parser = argparse.ArgumentParser(
-        description="Automatically reframe videos with intelligent tracking"
+        description="Automatically reframe videos by shifting X position only (no zoom/resize)"
     )
     
     parser.add_argument(
@@ -128,7 +154,7 @@ def main():
         "--aspect", "-a",
         type=parse_aspect_ratio,
         default="9:16",
-        help="Output aspect ratio (default: 9:16)"
+        help="Output aspect ratio for cropping (default: 9:16)"
     )
     
     parser.add_argument(
