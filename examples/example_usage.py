@@ -1,7 +1,3 @@
-"""
-Example usage of the Auto Reframe app
-"""
-
 from src.main import AutoReframer
 
 
